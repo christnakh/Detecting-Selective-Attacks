@@ -98,17 +98,11 @@ MIN_SEND_INTERVAL = 0.5   # time units between packet transmissions
 # HELPER FUNCTIONS
 # ----------------------------
 def compute_distance(node1, node2):
-    """Compute Euclidean distance between two nodes based on their positions."""
     (x1, y1) = node1.position
     (x2, y2) = node2.position
     return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
 
 def compute_energy_cost(distance, base_distance=50):
-    """
-    Compute energy cost based on distance.
-    Nodes communicating over a short distance consume less energy.
-    A maximum cap is enforced to prevent sudden, very large energy drops.
-    """
     min_cost = 0.05
     cost = ENERGY_CONSUMPTION * (distance / base_distance)
     # Cap the maximum cost.
@@ -307,7 +301,6 @@ class Node:
         self.rl_model = rl_model
 
     def _clear_queue(self):
-        """Empty the node's packet queue so that no further work is done after deactivation."""
         while self.queue.items:
             try:
                 self.queue.items.pop(0)
