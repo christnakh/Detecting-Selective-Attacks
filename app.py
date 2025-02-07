@@ -6,6 +6,7 @@ import random
 import pandas as pd
 import matplotlib.pyplot as plt
 import string
+import math
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -28,10 +29,10 @@ metrics_summary = {
 }
 
 # ----------------------------
-# LOGGING CONFIG (tune level as needed)
+# LOGGING CONFIG
 # ----------------------------
 logger = logging.getLogger("SimulationLogger")
-logger.setLevel(logging.DEBUG)  # Use INFO for production runs.
+logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler("simulation_output.txt", mode="w")
 file_handler.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler(sys.stdout)
@@ -45,22 +46,24 @@ logger.addHandler(console_handler)
 # ----------------------------
 # CONSTANTS
 # ----------------------------
-ENERGY_CONSUMPTION = 0.2
+ENERGY_CONSUMPTION = 0.2  # base energy consumption factor
 MAX_SEQUENCE_NO = 100
 ALARM_THRESHOLD = 5
 PACKET_LOSS_THRESHOLD = 5  
 INITIAL_ENERGY = 100
 
-# Back-off: Base value used in dynamic calculation
+# Back-off constants for dynamic route discovery
 BACK_OFF_TIME_BASE = 3    # base back-off time in time units
 BACK_OFF_TIME_MAX = 10    # maximum allowed back-off
 
-# Route expiration constant (time units)
+# Route expiration (time units)
 ROUTE_EXPIRY_TIME = 30
 
-# New constants for the upgraded routing table and block messages
-MAX_ROUTES = 3            # Each destination can store up to 3 alternate routes.
-BLOCK = 'block'           # Packet type for block messages.
+# Routing table: Increase cached routes from 3 to 5 per destination.
+MAX_ROUTES = 5            
+
+# Packet type for block messages.
+BLOCK = 'block'
 
 # Packet types
 FORWARDING = 'forwarding'
@@ -79,6 +82,55 @@ BASE_STATION_ID = 'BS'
 
 DEFAULT_TTL = 10
 
+# Sleep management: if no activity for this many time units, the node goes to sleep.
+SLEEP_THRESHOLD = 10
+
+# New constants for energy management
+MIN_OPERATING_ENERGY = 0.1  # if a node's energy falls below this value, it is considered dead
+MAX_ENERGY_COST = 1.0       # cap: no single packet transmission will cost more than this amount
+
+# ----------------------------
+# NEW: MINIMUM SEND INTERVAL TO LIMIT BURST ENERGY CONSUMPTION
+# ----------------------------
+MIN_SEND_INTERVAL = 0.5   # time units between packet transmissions
+
+# ----------------------------
+# HELPER FUNCTIONS
+# ----------------------------
+def compute_distance(node1, node2):
+    """Compute Euclidean distance between two nodes based on their positions."""
+    (x1, y1) = node1.position
+    (x2, y2) = node2.position
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+def compute_energy_cost(distance, base_distance=50):
+    """
+    Compute energy cost based on distance.
+    Nodes communicating over a short distance consume less energy.
+    A maximum cap is enforced to prevent sudden, very large energy drops.
+    """
+    min_cost = 0.05
+    cost = ENERGY_CONSUMPTION * (distance / base_distance)
+    # Cap the maximum cost.
+    cost = min(cost, MAX_ENERGY_COST)
+    return max(min_cost, cost)
+
+def consume_energy(node, amount=ENERGY_CONSUMPTION):
+    if not node.active:
+        return
+
+    # If the node does not have enough energy to cover the consumption, log and deactivate it.
+    if node.energy < amount:
+        logger.info(f"Time {node.env.now}: Node {node.id} has insufficient energy ({node.energy:.2f}J) "
+                    f"to consume {amount:.2f}J. Deactivating node.")
+        node.energy = 0
+        node.active = False
+        metrics_summary['Nodes_deactivated'] += 1
+        node._clear_queue()
+    else:
+        node.energy -= amount
+        logger.info(f"Time {node.env.now}: Node {node.id} consumes {amount:.2f}J. Energy left: {node.energy:.2f}")
+
 # ----------------------------
 # PACKET CLASS
 # ----------------------------
@@ -96,22 +148,6 @@ class Packet:
         self.previous_node = previous_node
         self.ttl = ttl
         self.final_dest = final_dest
-
-# ----------------------------
-# ENERGY HELPER
-# ----------------------------
-def consume_energy(node, amount=ENERGY_CONSUMPTION):
-    if not node.active:
-        return
-    actual = min(node.energy, amount)
-    node.energy -= actual
-    logger.info(f"Time {node.env.now}: Node {node.id} consumes {actual} J. Energy left: {node.energy:.2f}")
-    if node.energy <= 0:
-        node.energy = 0
-        if node.active:
-            node.active = False
-            metrics_summary['Nodes_deactivated'] += 1
-            logger.warning(f"Time {node.env.now}: Node {node.id} depleted energy, now inactive.")
 
 # ----------------------------
 # DSR PROTOCOL
@@ -226,7 +262,7 @@ class RoutingEnv(Env):
         pass
 
 # ----------------------------
-# NODE CLASS WITH ADVANCED PERFORMANCE ENHANCEMENTS
+# NODE CLASS WITH ADVANCED FEATURES
 # ----------------------------
 class Node:
     def __init__(self, env, node_id, network, protocol=DSR, is_base_station=False,
@@ -238,8 +274,11 @@ class Node:
         self.is_base_station = is_base_station
         self.energy = INITIAL_ENERGY
         self.active = True
-        self.state = 'idle'
-        self.routing_table = {}  # will be upgraded later by Network
+        self.state = 'active'
+        self.last_active_time = self.env.now
+        # Random position for adaptive transmission power (x, y) in a 100x100 area.
+        self.position = (random.uniform(0, 100), random.uniform(0, 100))
+        self.routing_table = {}  # will be set up by Network
         self.sequence_no = 0
         self.queue = simpy.Store(env)
 
@@ -250,11 +289,12 @@ class Node:
         self.packets_sent = 0
         self.packets_received = 0
         self.process = env.process(self.run())
+        self.env.process(self.manage_sleep_cycle())
         # For rate-limiting route discoveries (stores last discovery time per destination)
         self.last_rreq_time = {}
 
-        # Start process to prune stale or expired routes.
-        self.env.process(self.prune_routing_table())
+        # NEW: Initialize last send time to enforce a minimum send interval
+        self.last_send_time = -MIN_SEND_INTERVAL
 
         if not self.is_base_station:
             if self.protocol == DSR:
@@ -266,35 +306,104 @@ class Node:
         self.scaler = scaler
         self.rl_model = rl_model
 
+    def _clear_queue(self):
+        """Empty the node's packet queue so that no further work is done after deactivation."""
+        while self.queue.items:
+            try:
+                self.queue.items.pop(0)
+            except Exception as e:
+                logger.error(f"Error clearing queue for {self.id}: {e}")
+
     def run(self):
+        # Modify the run loop to terminate once the node is inactive
         while self.active:
             packet = yield self.queue.get()
+            # Check if the node has been deactivated meanwhile; if so, exit the loop.
             if not self.active:
+                logger.info(f"Time {self.env.now}: Node {self.id} is inactive; terminating packet processing loop.")
                 break
+            # Wake up if sleeping.
+            if self.state == "sleep":
+                self.state = "active"
+                logger.info(f"Time {self.env.now}: Node {self.id} is waking up to process a packet.")
+            self.last_active_time = self.env.now
             if self.is_base_station:
                 self.handle_alarm(packet)
             else:
                 self.receive_packet(packet)
+            # Add a small processing delay to smooth energy consumption
+            yield self.env.timeout(0.1)
+
+    def manage_sleep_cycle(self):
+        while self.active:
+            yield self.env.timeout(5)
+            if (self.env.now - self.last_active_time) > SLEEP_THRESHOLD and self.state != "sleep":
+                self.state = "sleep"
+                logger.info(f"Time {self.env.now}: Node {self.id} is entering sleep mode due to inactivity.")
 
     def _send_packet(self, packet):
         if not self.active:
             return
         with self.network.send_lock.request() as req:
             yield req
-            consume_energy(self)
-            self.packets_sent += 1
-            logger.info(f"Time {self.env.now}: {self.id} sends {packet.type} -> {packet.dest} (Prot: {self.protocol})")
-            self.network.send_packet(packet)
+            # Recheck active status after acquiring the lock.
+            if not self.active:
+                return
+            # Enforce a minimum interval between sends to avoid burst transmissions
+            time_since_last = self.env.now - self.last_send_time
+            if time_since_last < MIN_SEND_INTERVAL:
+                yield self.env.timeout(MIN_SEND_INTERVAL - time_since_last)
+            self.last_send_time = self.env.now
+
+            if self.state == "sleep":
+                self.state = "active"
+                logger.info(f"Time {self.env.now}: Node {self.id} woke up (after lock) to send a packet.")
+            self.last_active_time = self.env.now
+
+            # Determine energy cost based on distance (or use the base cost)
+            dest_node = self.network.nodes_dict.get(packet.dest)
+            if dest_node:
+                distance = compute_distance(self, dest_node)
+                cost = compute_energy_cost(distance)
+            else:
+                cost = ENERGY_CONSUMPTION
+
+            # Check if the node has sufficient energy to send the packet
+            # (i.e. energy after transmission must remain above MIN_OPERATING_ENERGY)
+            if self.energy < cost + MIN_OPERATING_ENERGY:
+                logger.info(f"Time {self.env.now}: Node {self.id} has insufficient energy "
+                            f"({self.energy:.2f}J) to send {packet.type} (requires at least {cost + MIN_OPERATING_ENERGY:.2f}J). Packet dropped.")
+                return
+
+            # Consume energy and abort sending if deactivated during consumption.
+            consume_energy(self, cost)
+            if not self.active:
+                return
+
+        self.packets_sent += 1
+        logger.info(f"Time {self.env.now}: {self.id} sends {packet.type} -> {packet.dest} (Prot: {self.protocol})")
+        self.network.send_packet(packet)
 
     def send_packet(self, packet):
         if not self.active:
+            logger.info(f"Time {self.env.now}: Node {self.id} is inactive; not sending packet {packet.type}.")
             return
+        # Wake up if needed.
+        if self.state == "sleep":
+            self.state = "active"
+            logger.info(f"Time {self.env.now}: Node {self.id} woke up to send a packet.")
+        self.last_active_time = self.env.now
         self.env.process(self._send_packet(packet))
 
     def receive_packet(self, packet):
         if not self.active:
+            logger.info(f"Time {self.env.now}: Node {self.id} is inactive; not processing incoming {packet.type} packet.")
             return
-        consume_energy(self)
+        # Receiving consumes a small fixed amount of energy.
+        consume_energy(self, ENERGY_CONSUMPTION * 0.5)
+        if not self.active:
+            return
+        self.last_active_time = self.env.now
         self.packets_received += 1
         logger.info(f"Time {self.env.now}: {self.id} received {packet.type} from {packet.src} (Prot: {self.protocol})")
         if packet.type == BLOCK:
@@ -326,7 +435,6 @@ class Node:
 
     # -------------------
     # Routing Table Helpers with Expiration
-    # Each route entry is stored as a tuple: [next_hop, seq_no, timestamp]
     # -------------------
     def add_route(self, dest, next_hop, seq_no):
         dest_index = self.network.node_index[dest]
@@ -355,15 +463,20 @@ class Node:
     def get_route(self, dest):
         dest_index = self.network.node_index[dest]
         best_route = None
-        best_seq = -1
+        best_energy = -1
         current_time = self.env.now
         for route in self.routing_table[dest_index]:
             if route is not None:
-                # Check if the route has expired
+                # Check expiration
                 if (current_time - route[2]) > ROUTE_EXPIRY_TIME:
                     continue
-                if route[1] > best_seq:
-                    best_seq = route[1]
+                next_hop = route[0]
+                neighbor = self.network.nodes_dict.get(next_hop)
+                if neighbor is None or not neighbor.active:
+                    continue
+                # Prefer the route whose next hop has the highest residual energy.
+                if neighbor.energy > best_energy:
+                    best_energy = neighbor.energy
                     best_route = route
         return best_route
 
@@ -372,7 +485,7 @@ class Node:
         self.routing_table[dest_index] = [None] * MAX_ROUTES
 
     def prune_routing_table(self):
-        """Periodically prune routing entries that have expired or whose next hop is inactive."""
+        """Periodically prune expired or inactive routes."""
         while self.active:
             yield self.env.timeout(5)
             current_time = self.env.now
@@ -392,7 +505,7 @@ class Node:
         key = (packet.src, packet.seq_no)
         if key in self.seen_rreq:
             if packet.ttl <= self.seen_rreq[key]:
-                logger.debug(f"Node {self.id}: Duplicate RREQ {key} with TTL {packet.ttl} <= stored TTL {self.seen_rreq[key]}, dropping.")
+                logger.debug(f"Node {self.id}: Duplicate RREQ {key} with TTL {packet.ttl} <= stored TTL, dropping.")
                 return
             else:
                 logger.debug(f"Node {self.id}: Duplicate RREQ {key} with higher TTL {packet.ttl}, processing.")
@@ -413,7 +526,7 @@ class Node:
                 route.append(self.id)
             rev_route = list(reversed(route))
             if len(rev_route) < 2:
-                logger.error(f"Node {self.id}: route too short for RREP: {rev_route}")
+                logger.error(f"Node {self.id}: Route too short for RREP: {rev_route}")
                 return
             next_hop = rev_route[1]
             rrep = Packet(RREP, self.id, next_hop, seq_no=packet.seq_no, path=rev_route)
@@ -534,11 +647,13 @@ class Node:
                 packet_loss = packet.payload.get("packet_loss", 0)
                 logger.warning(f"Time {self.env.now}: {self.id} got ALARM about {src_node_id} (packet_loss: {packet_loss}).")
                 if self.is_base_station:
-                    last_seq = self.last_alarm_seq.get(packet.src, 0)
-                    if packet.seq_no is None or packet.seq_no <= last_seq:
+                    last_seq = getattr(self, 'last_alarm_seq', {})
+                    stored_seq = last_seq.get(packet.src, 0)
+                    if packet.seq_no is None or packet.seq_no <= stored_seq:
                         logger.warning("Stale or invalid alarm sequence number. Dropping alarm.")
                         return
-                    self.last_alarm_seq[packet.src] = packet.seq_no
+                    last_seq[packet.src] = packet.seq_no
+                    self.last_alarm_seq = last_seq
                     suspected = self.network.nodes_dict.get(src_node_id)
                     if suspected:
                         expected_energy = INITIAL_ENERGY - (suspected.packets_sent + suspected.packets_received) * ENERGY_CONSUMPTION
@@ -553,6 +668,7 @@ class Node:
                     logger.info(f"Node {self.id} (non-BS) received ALARM about {src_node_id}.")
             else:
                 logger.warning(f"Time {self.env.now}: {self.id} got ALARM with no 'src' info.")
+
     def broadcast_block_message(self, malicious_node_id):
         for node in self.network.nodes:
             if node.id != malicious_node_id and node.active:
@@ -598,12 +714,11 @@ class Node:
             self.initiate_route_discovery(dest)
 
     def initiate_route_discovery(self, dest):
-        # Dynamic Back-off: Increase waiting time inversely with remaining energy.
         current_time = self.env.now
         energy_factor = INITIAL_ENERGY / (self.energy if self.energy > 0 else 1)
         dynamic_backoff = min(BACK_OFF_TIME_BASE * energy_factor, BACK_OFF_TIME_MAX)
         if dest in self.last_rreq_time and (current_time - self.last_rreq_time[dest]) < dynamic_backoff:
-            logger.info(f"Node {self.id}: Backing off route discovery for {dest} (dynamic back-off = {dynamic_backoff}).")
+            logger.info(f"Node {self.id}: Backing off route discovery for {dest} (back-off = {dynamic_backoff}).")
             return
         self.last_rreq_time[dest] = current_time
         if self.protocol == DSR:
@@ -857,33 +972,34 @@ def initiate_routes_rl(env, network, node, dest):
             node.make_routing_decision_rl(dest)
 
 # ----------------------------
-# RANDOM ALARM TRIGGER
+# NEW: ALARM TRIGGER PROCESS BASED ON PACKET LOSS
 # ----------------------------
 def send_random_alarms(env, network):
     while True:
-        yield env.timeout(1)
-        active_nodes = [n for n in network.nodes if n.active and not n.is_base_station]
-        if not active_nodes:
+        yield env.timeout(4)
+        # Only consider nodes that have high packet loss
+        nodes_exceeding = [n for n in network.nodes if n.active and not n.is_base_station and (n.packets_sent - n.packets_received) > PACKET_LOSS_THRESHOLD]
+        if not nodes_exceeding:
             continue
-        suspected = random.choice(active_nodes)
-        bs_node = network.nodes_dict.get(BASE_STATION_ID)
-        if bs_node and bs_node.active:
-            suspected.sequence_no += 1
-            alarm_packet = Packet(
-                ALARM,
-                src=suspected.id,
-                dest=bs_node.id,
-                seq_no=suspected.sequence_no,
-                payload={
-                    "src": suspected.id,
-                    "packet_loss": suspected.packets_sent - suspected.packets_received
-                }
-            )
-            metrics_summary['Alarms_sent'] += 1
-            logger.warning(f"Time {env.now}: Generating ALARM about {suspected.id}, sending to BS.")
-            suspected.send_packet(alarm_packet)
-        else:
-            logger.warning("No active Base Station or no active nodes to suspect.")
+        for suspected in nodes_exceeding:
+            bs_node = network.nodes_dict.get(BASE_STATION_ID)
+            if bs_node and bs_node.active:
+                suspected.sequence_no += 1
+                alarm_packet = Packet(
+                    ALARM,
+                    src=suspected.id,
+                    dest=bs_node.id,
+                    seq_no=suspected.sequence_no,
+                    payload={
+                        "src": suspected.id,
+                        "packet_loss": suspected.packets_sent - suspected.packets_received
+                    }
+                )
+                metrics_summary['Alarms_sent'] += 1
+                logger.warning(f"Time {env.now}: Generating ALARM about {suspected.id}, sending to BS.")
+                suspected.send_packet(alarm_packet)
+            else:
+                logger.warning("No active Base Station available for alarming.")
 
 # ----------------------------
 # MAIN SIMULATION
