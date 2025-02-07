@@ -69,18 +69,29 @@ The simulation is built using Python with libraries such as **SimPy** for proces
 - **Detection Rate:** Assesses the accuracy of the alarm system in identifying faulty or malicious nodes.
 
 ## Running the Simulation
-1. Ensure all required Python packages are installed:
+1. How to install python on window and mac:
+window : [text](https://www.youtube.com/watch?v=IPOr0ran2Oo)
+mac: [text](https://www.youtube.com/watch?v=nhv82tvFfkM)
+2. Ensure all required Python packages are installed:
    ```bash
+   window:
    pip install simpy networkx pandas matplotlib tensorflow stable-baselines3 gym numpy
+
+   mac: 
+   pip3 install simpy networkx pandas matplotlib tensorflow stable-baselines3 gym numpy
    ```
 
-2. Run the main simulation script:
+3. Run the main simulation script:
    ```bash
+   window:
    python simulation.py
+   mac:
+   python3 simulation.py
    ```
 
-3. Analyze the generated CSV files (`simulation_data.csv`, `performance_metrics.csv`) and the log file (`simulation_output.txt`) for detailed performance insights.
+4. Analyze the generated CSV files (`simulation_data.csv`, `performance_metrics.csv`) and the log file (`simulation_output.txt`) for detailed performance insights.
 
 ## Conclusion
 This project demonstrates a comprehensive approach to optimizing the DSR protocol through energy-efficient routing, advanced fault detection, and intelligent decision-making using ML and RL. The simulation provides a robust framework for testing and further enhancing network protocols in dynamic and resource-constrained environments.
+
 
