@@ -25,7 +25,10 @@ metrics_summary = {
     'Forwarding_sent': 0,
     'Alarms_sent': 0,
     'Routes_established': 0,
-    'Nodes_deactivated': 0
+    'Nodes_deactivated': 0,
+    'ACK_sent': 0,
+    'ACK_received': 0,
+    'DoS_packets_sent': 0
 }
 
 # ----------------------------
@@ -65,6 +68,10 @@ MAX_ROUTES = 5
 # Packet type for block messages.
 BLOCK = 'block'
 
+# New packet types for ACK and DoS
+ACK = 'ACK'
+DOS = 'DOS'
+
 # Packet types
 FORWARDING = 'forwarding'
 ALARM = 'alarm'
@@ -89,9 +96,7 @@ SLEEP_THRESHOLD = 10
 MIN_OPERATING_ENERGY = 0.1  # if a node's energy falls below this value, it is considered dead
 MAX_ENERGY_COST = 1.0       # cap: no single packet transmission will cost more than this amount
 
-# ----------------------------
-# NEW: MINIMUM SEND INTERVAL TO LIMIT BURST ENERGY CONSUMPTION
-# ----------------------------
+# New: MINIMUM SEND INTERVAL TO LIMIT BURST ENERGY CONSUMPTION
 MIN_SEND_INTERVAL = 0.5   # time units between packet transmissions
 
 # ----------------------------
@@ -174,7 +179,7 @@ class DSRProtocol:
             next_hop = route_entry[0]
             packet = Packet(
                 FORWARDING, self.node.id, next_hop, seq_no=self.node.sequence_no,
-                payload=payload, final_dest=final_dest
+                payload=payload, final_dest=final_dest, previous_node=self.node.id
             )
             logger.debug(f"Node {self.node.id} (DSR): Forwarding data to {final_dest} via {next_hop}")
             self.node.send_packet(packet)
@@ -207,7 +212,7 @@ class SFAProtocol:
     def send_forwarding_packet(self, dest, payload):
         self.node.sequence_no += 1
         metrics_summary['Forwarding_sent'] += 1
-        packet = Packet(FORWARDING, self.node.id, dest, seq_no=self.node.sequence_no, payload=payload)
+        packet = Packet(FORWARDING, self.node.id, dest, seq_no=self.node.sequence_no, payload=payload, previous_node=self.node.id)
         logger.debug(f"Node {self.node.id} (SFA): Forwarding data to {dest}")
         self.node.send_packet(packet)
 
@@ -300,6 +305,10 @@ class Node:
         self.scaler = scaler
         self.rl_model = rl_model
 
+        # Start periodic sensor data transmission (WSN behavior)
+        if not self.is_base_station:
+            self.env.process(self.sense_and_transmit())
+
     def _clear_queue(self):
         while self.queue.items:
             try:
@@ -320,6 +329,15 @@ class Node:
                 self.state = "active"
                 logger.info(f"Time {self.env.now}: Node {self.id} is waking up to process a packet.")
             self.last_active_time = self.env.now
+            # Special handling for DOS and ACK packets
+            if packet.type == DOS:
+                logger.warning(f"Time {self.env.now}: {self.id} received DOS packet from {packet.src}.")
+                consume_energy(self, ENERGY_CONSUMPTION * 0.5)  # DOS packets drain extra energy
+                continue
+            if packet.type == ACK:
+                self.handle_ack(packet)
+                continue
+
             if self.is_base_station:
                 self.handle_alarm(packet)
             else:
@@ -362,7 +380,6 @@ class Node:
                 cost = ENERGY_CONSUMPTION
 
             # Check if the node has sufficient energy to send the packet
-            # (i.e. energy after transmission must remain above MIN_OPERATING_ENERGY)
             if self.energy < cost + MIN_OPERATING_ENERGY:
                 logger.info(f"Time {self.env.now}: Node {self.id} has insufficient energy "
                             f"({self.energy:.2f}J) to send {packet.type} (requires at least {cost + MIN_OPERATING_ENERGY:.2f}J). Packet dropped.")
@@ -425,6 +442,35 @@ class Node:
                 self.handle_sfa_rerr(packet)
             elif packet.type == ALARM:
                 self.handle_alarm(packet)
+
+    # -------------------
+    # ACK METHODS
+    # -------------------
+    def send_ack(self, original_packet):
+        ack_packet = Packet(ACK, self.id, original_packet.previous_node, seq_no=self.sequence_no, payload={"ack_for": original_packet.type})
+        metrics_summary['ACK_sent'] += 1
+        logger.info(f"Time {self.env.now}: {self.id} sending ACK to {original_packet.previous_node} for packet type {original_packet.type}")
+        self.send_packet(ack_packet)
+
+    def handle_ack(self, packet):
+        logger.info(f"Time {self.env.now}: {self.id} received ACK from {packet.src} for packet {packet.payload.get('ack_for') if packet.payload else 'unknown'}")
+        metrics_summary['ACK_received'] += 1
+
+    # -------------------
+    # WSN SENSOR DATA TRANSMISSION
+    # -------------------
+    def sense_and_transmit(self):
+        while self.active:
+            # Wait a random interval between sensor readings
+            yield self.env.timeout(random.uniform(8, 12))
+            if self.active:
+                sensor_data = f"Sensor reading from {self.id} at time {self.env.now}"
+                logger.info(f"Time {self.env.now}: {self.id} sensing data: {sensor_data}")
+                # Use the forwarding mechanism to send sensor data to the Base Station
+                if self.protocol == DSR:
+                    self.protocol_handler.send_forwarding_packet(BASE_STATION_ID, sensor_data)
+                else:
+                    self.protocol_handler.send_forwarding_packet(BASE_STATION_ID, sensor_data)
 
     # -------------------
     # Routing Table Helpers with Expiration
@@ -558,9 +604,13 @@ class Node:
             logger.error(f"Node {self.id}: RREP route exhausted: {packet.path}")
 
     def handle_forwarding(self, packet):
+        # For DSR: use final_dest; for SFA: use dest field.
         if self.protocol == DSR:
             if packet.final_dest == self.id:
                 logger.info(f"Time {self.env.now}: Node {self.id}: Data arrived from {packet.src}")
+                # Send ACK to the previous hop if available
+                if packet.previous_node:
+                    self.send_ack(packet)
                 return
             route_entry = self.get_route(packet.final_dest)
             if route_entry:
@@ -573,6 +623,11 @@ class Node:
                 logger.warning(f"Node {self.id}: No DSR route to {packet.final_dest}. Initiating route discovery.")
                 self.protocol_handler.send_rreq(packet.final_dest)
         else:
+            if packet.dest == self.id:
+                logger.info(f"Time {self.env.now}: Node {self.id}: Data arrived from {packet.src}")
+                if packet.previous_node:
+                    self.send_ack(packet)
+                return
             route = self.get_route(packet.dest)
             if route:
                 next_hop = route[0]
@@ -720,6 +775,27 @@ class Node:
             self.protocol_handler.send_rreq(dest)
 
 # ----------------------------
+# MALICIOUS NODE (DoS)
+# ----------------------------
+class MaliciousNode(Node):
+    def __init__(self, env, node_id, network, protocol=DSR):
+        super().__init__(env, node_id, network, protocol=protocol)
+        self.malicious = True
+        self.env.process(self.launch_dos_attack())
+    
+    def launch_dos_attack(self):
+        while self.active:
+            # Flood the network with DOS packets to all neighbors
+            neighbors = self.network.get_neighbors(self.id)
+            for neighbor in neighbors:
+                self.sequence_no += 1
+                dos_packet = Packet(DOS, self.id, neighbor, seq_no=self.sequence_no, payload={"dos": True})
+                metrics_summary['DoS_packets_sent'] += 1
+                logger.warning(f"Time {self.env.now}: Malicious node {self.id} flooding DOS packet to {neighbor}")
+                self.send_packet(dos_packet)
+            yield self.env.timeout(1)
+
+# ----------------------------
 # BASE STATION
 # ----------------------------
 class BaseStation(Node):
@@ -764,6 +840,11 @@ class Network:
         self.nodes.append(bs)
         self.nodes_dict[BASE_STATION_ID] = bs
         self.graph.add_node(BASE_STATION_ID)
+        # Add a malicious node for DoS attacks
+        mal_node = MaliciousNode(self.env, "Malicious Node", self, protocol=self.protocol)
+        self.nodes.append(mal_node)
+        self.nodes_dict["Malicious Node"] = mal_node
+        self.graph.add_node("Malicious Node")
 
     def create_edges(self, edge_list):
         for edge in edge_list:
@@ -896,6 +977,7 @@ def train_rl_agent(network, node, dest, timesteps=5000):
 def initiate_routes_dsr(env, network):
     while True:
         yield env.timeout(random.randint(1, 5))
+        # yield env.timeout(3)  # Fixed timeout for DSR
         active_nodes = [n for n in network.nodes if not n.is_base_station and n.active]
         if not active_nodes:
             continue
@@ -910,6 +992,7 @@ def initiate_routes_dsr(env, network):
 def initiate_routes_sfa(env, network):
     while True:
         yield env.timeout(random.randint(1, 5))
+        # yield env.timeout(3)  # Same fixed timeout for SFA
         active_nodes = [n for n in network.nodes if not n.is_base_station and n.active]
         if not active_nodes:
             continue
@@ -1123,6 +1206,9 @@ if __name__ == "__main__":
         f"Total RERRs sent: {metrics_summary['RERR_sent']}\n"
         f"Total Forwarding Packets sent: {metrics_summary['Forwarding_sent']}\n"
         f"Total ALARM messages sent: {metrics_summary['Alarms_sent']}\n"
+        f"Total ACKs sent: {metrics_summary['ACK_sent']}\n"
+        f"Total ACKs received: {metrics_summary['ACK_received']}\n"
+        f"Total DoS Packets sent: {metrics_summary['DoS_packets_sent']}\n"
         f"Total Successful Routes Established: {metrics_summary['Routes_established']}\n"
         f"Total Nodes Deactivated due to Energy Loss: {metrics_summary['Nodes_deactivated']}\n"
         "--------------------------------\n"
@@ -1134,5 +1220,3 @@ if __name__ == "__main__":
     with open("data/simulation_functionality.txt", "w") as f:
         f.write(summary_text)
     logger.info("Saved simulation summary to simulation_functionality.txt.")
-
-
