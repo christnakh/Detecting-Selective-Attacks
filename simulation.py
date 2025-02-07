@@ -33,7 +33,7 @@ metrics_summary = {
 # ----------------------------
 logger = logging.getLogger("SimulationLogger")
 logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler("simulation_output.txt", mode="w")
+file_handler = logging.FileHandler("data/simulation_output.txt", mode="w")
 file_handler.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
@@ -1049,7 +1049,7 @@ if __name__ == "__main__":
     if data_store:
         full_data = pd.concat(data_store, ignore_index=True)
         logger.info("\nSample of first simulation data:\n{}".format(full_data.head()))
-        full_data.to_csv("simulation_data.csv", index=False)
+        full_data.to_csv("data/simulation_data.csv", index=False)
         logger.info("Exported first simulation data to simulation_data.csv.")
     else:
         logger.error("No data from first simulation.")
@@ -1079,7 +1079,7 @@ if __name__ == "__main__":
 
     if data_store:
         full_data = pd.concat(data_store, ignore_index=True)
-        full_data.to_csv("simulation_data.csv", index=False)
+        full_data.to_csv("data/simulation_data.csv", index=False)
         logger.info("Second simulation data appended and exported.")
         metrics = {}
         for proto, net in networks2.items():
@@ -1110,7 +1110,7 @@ if __name__ == "__main__":
             logger.info("SFA has a higher malicious detection rate compared to DSR.")
         else:
             logger.info("DSR has a higher malicious detection rate compared to SFA.")
-        metrics_df.to_csv("performance_metrics.csv", index=True)
+        metrics_df.to_csv("data/performance_metrics.csv", index=True)
     else:
         logger.error("No data after second simulation.")
 
@@ -1131,6 +1131,8 @@ if __name__ == "__main__":
         "--------------------------------\n"
         "End of Simulation Functionality Summary."
     )
-    with open("simulation_functionality.txt", "w") as f:
+    with open("data/simulation_functionality.txt", "w") as f:
         f.write(summary_text)
     logger.info("Saved simulation summary to simulation_functionality.txt.")
+
+
